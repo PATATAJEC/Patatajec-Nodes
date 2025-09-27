@@ -4,6 +4,7 @@ import math
 import torch
 import json 
 import numpy as np
+import re
 
 class ColorPicker:
     @classmethod
@@ -471,6 +472,195 @@ Blend z kolorem lub obrazem: normal, screen, additive color, overlay, multiply, 
             pil_a = pil_a.resize((out_w, out_h), resample=Image.BILINEAR)
             a_resized = np.asarray(pil_a).astype(np.float32) / 255.0
         return a_resized[..., None]
+
+
+class ImageDifferenceToAlpha:
+    """
+    Porównuje A z B lub A z kolorem HEX.
+    • RGB: kolorowa różnica abs(A-B) (lub inne tryby)
+    • ALPHA: siła różnicy (mean/max)
+    DODATKOWO:
+      Gdy source='hex_color' i podłączysz image_b, różnica (A vs HEX) jest
+      kompozycjonowana NA image_b i to jest wynikiem (RGBA).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_a": ("IMAGE",),
+                "source": (["image", "hex_color"], {"default": "image"}),
+
+                # alfa = jak liczymy siłę różnicy
+                "alpha_mode": (["mean", "max"], {"default": "max"}),
+                "normalize_alpha": ("BOOLEAN", {"default": False}),
+
+                # RGB wyjściowe nakładki (gdy nie kompozycjonujemy na tło)
+                "rgb_mode": (["diff", "image_b", "black"], {"default": "diff"}),
+                "boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+            },
+            "optional": {
+                # Użycie zależne od 'source':
+                # - source='image'  -> image_b = obraz porównawczy
+                # - source='hex_color' + image_b podpięte -> tło do kompozycji
+                "image_b": ("IMAGE",),
+                "color_hex": ("STRING", {"default": "#808080"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "diff_to_alpha"
+    CATEGORY = "Image/Compare"
+    DESCRIPTION = ("Kolorowa różnica + alfa; opcjonalny kompozyt na image_b, jeśli source=hex_color.")
+
+    # ---------- utils ----------
+    def _ensure_tensor(self, x, name):
+        if not isinstance(x, torch.Tensor):
+            raise ValueError(f"{name} musi być tensorem torch (BxHxWxC).")
+        if x.ndim != 4:
+            raise ValueError(f"{name}: oczekiwany kształt BxHxWxC.")
+        if x.shape[-1] not in (3, 4):
+            raise ValueError(f"{name}: obsługiwane kanały: 3 (RGB) lub 4 (RGBA).")
+        return x
+
+    def _resize_like(self, src, target_h, target_w):
+        # src: (H,W,C) -> (target_h,target_w,C) w [0,1]
+        t = torch.from_numpy(src.transpose(2, 0, 1)).unsqueeze(0)  # 1xCxHxW
+        t = torch.nn.functional.interpolate(t, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return t.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy()
+
+    def _parse_hex(self, s):
+        if s is None:
+            return (0.5, 0.5, 0.5)
+        txt = str(s).strip()
+        if txt.startswith("#"):
+            txt = txt[1:]
+        txt = txt.lower()
+
+        if re.fullmatch(r"[0-9a-f]{3}", txt):
+            r = int(txt[0]*2, 16); g = int(txt[1]*2, 16); b = int(txt[2]*2, 16)
+        elif re.fullmatch(r"[0-9a-f]{6}", txt):
+            r = int(txt[0:2], 16); g = int(txt[2:4], 16); b = int(txt[4:6], 16)
+        else:
+            parts = [p.strip() for p in txt.replace(";", ",").split(",") if p.strip()]
+            if len(parts) >= 3:
+                try:
+                    r = int(float(parts[0])); g = int(float(parts[1])); b = int(float(parts[2]))
+                except Exception:
+                    return (0.5, 0.5, 0.5)
+            else:
+                return (0.5, 0.5, 0.5)
+
+        r = np.clip(r, 0, 255) / 255.0
+        g = np.clip(g, 0, 255) / 255.0
+        b = np.clip(b, 0, 255) / 255.0
+        return (float(r), float(g), float(b))
+
+    # --------- core ----------
+    def diff_to_alpha(self, image_a, source, alpha_mode="max", normalize_alpha=False,
+                      rgb_mode="diff", boost=1.0, image_b=None, color_hex="#808080"):
+
+        a = self._ensure_tensor(image_a, "image_a").detach().clamp(0.0, 1.0)
+        device = a.device
+        A_B, A_H, A_W, _ = a.shape
+        a_cpu = a.to(torch.float32).cpu().numpy()
+
+        use_image = (str(source).lower() == "image")
+
+        # Przygotowanie B (porównanie albo tło)
+        b_cpu = None
+        if use_image:
+            if image_b is None:
+                raise ValueError("Wybrano source=image, ale nie podłączono image_b.")
+            b = self._ensure_tensor(image_b, "image_b").detach().clamp(0.0, 1.0)
+            B_B, _, _, _ = b.shape
+            b_cpu = b.to(torch.float32).cpu().numpy()
+        else:
+            base_rgb = np.array(self._parse_hex(color_hex), dtype=np.float32)
+            # jeżeli image_b podpięte w tym trybie -> posłuży jako TŁO do kompozycji
+            bg_cpu = None
+            if image_b is not None:
+                bg = self._ensure_tensor(image_b, "image_b (background)").detach().clamp(0.0, 1.0)
+                BG_B, _, _, _ = bg.shape
+                bg_cpu = bg.to(torch.float32).cpu().numpy()
+
+        out_frames = []
+
+        for i in range(A_B):
+            ai = a_cpu[i]
+            a_rgb = ai[..., :3]
+
+            if use_image:
+                # klasyczny tryb porównania A vs image_b
+                j = min(i, B_B - 1)
+                bi = b_cpu[j]
+                b_rgb = bi[..., :3]
+                if bi.shape[0] != A_H or bi.shape[1] != A_W:
+                    b_rgb = self._resize_like(b_rgb, A_H, A_W)
+            else:
+                # porównujemy A do stałego koloru
+                b_rgb = np.broadcast_to(base_rgb, (A_H, A_W, 3)).copy()
+
+            # --- różnica kolorowa ---
+            diff = np.abs(a_rgb - b_rgb)  # HxWx3, 0..1
+            try:
+                k = max(0.0, float(boost))
+            except Exception:
+                k = 1.0
+            diff = np.clip(diff * k, 0.0, 1.0)
+
+            # --- alfa ---
+            if str(alpha_mode).lower() == "mean":
+                alpha = diff.mean(axis=2)
+            else:
+                alpha = diff.max(axis=2)
+
+            if normalize_alpha:
+                m = float(alpha.max())
+                if m > 1e-8:
+                    alpha = alpha / m
+            alpha = np.clip(alpha, 0.0, 1.0)
+
+            # --- RGB nakładki (gdy nie kompozycjonujemy) ---
+            mode = str(rgb_mode).lower()
+            if mode == "image_b" and use_image:
+                rgb_overlay = b_rgb
+            elif mode == "black":
+                rgb_overlay = np.zeros_like(diff)
+            else:
+                rgb_overlay = diff  # "diff"
+
+            if not use_image and image_b is not None:
+                # === SPECJALNY TRYB: source=hex_color + image_b podpięte → KOMPOZYT ===
+                jbg = min(i, BG_B - 1)
+                bg_i = bg_cpu[jbg]
+                bg_rgb = bg_i[..., :3]
+                if bg_i.shape[0] != A_H or bg_i.shape[1] != A_W:
+                    bg_rgb = self._resize_like(bg_rgb, A_H, A_W)
+
+                # standard 'over': out = overlay*alpha + bg*(1-alpha)
+                out_rgb = rgb_overlay * alpha[..., None] + bg_rgb * (1.0 - alpha[..., None])
+
+                # alfa wyjściowa: jeśli tło ma alfę — zostaw; w innym razie pełna 1
+                if bg_i.shape[-1] == 4:
+                    bg_a = bg_i[..., 3:4]
+                    if bg_i.shape[0] != A_H or bg_i.shape[1] != A_W:
+                        bg_a = self._resize_like(bg_a, A_H, A_W)
+                    # złożenie alf (opcjonalnie można użyć bardziej złożonego wzoru)
+                    out_a = np.clip(bg_a, 0.0, 1.0)
+                else:
+                    out_a = np.ones((A_H, A_W, 1), dtype=np.float32)
+
+                out_rgba = np.concatenate([out_rgb, out_a], axis=-1).astype(np.float32)
+            else:
+                # klasyczny output: sama nakładka RGBA (bez kompozycji)
+                out_rgba = np.concatenate([rgb_overlay, alpha[..., None]], axis=-1).astype(np.float32)
+
+            out_frames.append(torch.from_numpy(out_rgba))
+
+        out = torch.stack(out_frames, dim=0).to(torch.float32).to(device).clamp(0.0, 1.0)
+        return (out,)
 
 
 class SequenceContentZoom:

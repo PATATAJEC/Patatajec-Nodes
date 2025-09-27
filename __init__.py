@@ -10,6 +10,8 @@ NODE_CONFIG = {
      "SequenceContentZoom": {"class": SequenceContentZoom, "name": "Sequence Content Zoom"},
      "SequenceBlend": {"class": SequenceBlend, "name": "Sequence Blend"},
      "ColorPicker": {"class": ColorPicker, "name": "Color Picker"},
+     "ImageDifferenceToAplpha": {"class": ImageDifferenceToAlpha, "name": "Image Difference to Alpha"},
+
 }
 
 def generate_node_mappings(node_config):
