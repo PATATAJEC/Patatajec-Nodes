@@ -84,6 +84,11 @@ Wejście `color` akceptuje też ręcznie wpisane "R,G,B" lub JSON "[R,G,B]".
     def _rgb_to_hex(self, r, g, b):
         return f"#{int(r):02X}{int(g):02X}{int(b):02X}"
 
+import torch
+import numpy as np
+import json
+import re
+
 class SequenceBlend:
     @classmethod
     def INPUT_TYPES(cls):
@@ -401,33 +406,74 @@ Blend z kolorem lub obrazem: normal, screen, additive color, overlay, multiply, 
         return []
 
     def _parse_rgb(self, s):
+        """
+        Akceptuje:
+          - HEX: "#RRGGBB" / "RRGGBB" / "#RGB" / "RGB"
+          - CSS: "rgb(r,g,b)" lub "rgba(r,g,b,a)" (alfa ignorowana)
+          - CSV: "r,g,b" lub "r;g;b"
+          - JSON: "[r,g,b]"
+        Wartości mogą być w 0..255 LUB 0..1. Zwraca (r,g,b) w 0..1.
+        """
+        # domyślny neutralny szary (pasuje do starego zachowania)
         default = (127/255.0, 127/255.0, 127/255.0)
+
         if s is None:
             return default
+
         txt = str(s).strip()
         if not txt:
             return default
-        try:
-            val = json.loads(txt)
-            if isinstance(val, (list, tuple)) and len(val) >= 3:
-                r, g, b = val[:3]
-                return (np.clip(float(r), 0, 255)/255.0,
-                        np.clip(float(g), 0, 255)/255.0,
-                        np.clip(float(b), 0, 255)/255.0)
-        except Exception:
-            pass
-        txt = txt.replace(";", ",")
-        if txt.startswith("[") and txt.endswith("]"):
-            txt = txt[1:-1]
-        parts = [p.strip() for p in txt.split(",") if p.strip()]
+
+        # --- HEX (#RRGGBB / #RGB) ---
+        t = txt.lower().strip()
+        if t.startswith("#"):
+            t = t[1:]
+        if re.fullmatch(r"[0-9a-f]{6}", t or ""):
+            r = int(t[0:2], 16); g = int(t[2:4], 16); b = int(t[4:6], 16)
+            return (r/255.0, g/255.0, b/255.0)
+        if re.fullmatch(r"[0-9a-f]{3}", t or ""):
+            r = int(t[0]*2, 16); g = int(t[1]*2, 16); b = int(t[2]*2, 16)
+            return (r/255.0, g/255.0, b/255.0)
+
+        # --- CSS rgb/rgba ---
+        m = re.match(r"rgba?\\s*\\(\\s*([0-9.]+)\\s*,\\s*([0-9.]+)\\s*,\\s*([0-9.]+)(?:\\s*,\\s*[0-9.]+)?\\s*\\)", txt, flags=re.IGNORECASE)
+        if m:
+            try:
+                rr = float(m.group(1)); gg = float(m.group(2)); bb = float(m.group(3))
+                if rr <= 1.0 and gg <= 1.0 and bb <= 1.0:
+                    return (np.clip(rr,0,1), np.clip(gg,0,1), np.clip(bb,0,1))
+                else:
+                    return (np.clip(rr,0,255)/255.0, np.clip(gg,0,255)/255.0, np.clip(bb,0,255)/255.0)
+            except Exception:
+                pass
+
+        # --- JSON [r,g,b] ---
+        if (txt.startswith("[") and txt.endswith("]")) or (txt.startswith("(") and txt.endswith(")")):
+            try:
+                val = json.loads(txt.replace("(", "[").replace(")", "]"))
+                if isinstance(val, (list, tuple)) and len(val) >= 3:
+                    rr, gg, bb = float(val[0]), float(val[1]), float(val[2])
+                    if rr <= 1.0 and gg <= 1.0 and bb <= 1.0:
+                        return (np.clip(rr,0,1), np.clip(gg,0,1), np.clip(bb,0,1))
+                    else:
+                        return (np.clip(rr,0,255)/255.0, np.clip(gg,0,255)/255.0, np.clip(bb,0,255)/255.0)
+            except Exception:
+                pass
+
+        # --- CSV "r,g,b" (lub z ";") ---
+        t2 = txt.replace(";", ",")
+        parts = [p.strip() for p in t2.split(",") if p.strip()]
         if len(parts) >= 3:
             try:
-                r = np.clip(float(parts[0]), 0, 255)/255.0
-                g = np.clip(float(parts[1]), 0, 255)/255.0
-                b = np.clip(float(parts[2]), 0, 255)/255.0
-                return (r, g, b)
+                rr = float(parts[0]); gg = float(parts[1]); bb = float(parts[2])
+                if rr <= 1.0 and gg <= 1.0 and bb <= 1.0:
+                    return (np.clip(rr,0,1), np.clip(gg,0,1), np.clip(bb,0,1))
+                else:
+                    return (np.clip(rr,0,255)/255.0, np.clip(gg,0,255)/255.0, np.clip(bb,0,255)/255.0)
             except Exception:
                 return default
+
+        # fallback
         return default
 
     def _to_pil_rgb(self, arr, Image):
@@ -472,7 +518,6 @@ Blend z kolorem lub obrazem: normal, screen, additive color, overlay, multiply, 
             pil_a = pil_a.resize((out_w, out_h), resample=Image.BILINEAR)
             a_resized = np.asarray(pil_a).astype(np.float32) / 255.0
         return a_resized[..., None]
-
 
 class ImageDifferenceToAlpha:
     """
